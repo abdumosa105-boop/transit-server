@@ -98,7 +98,7 @@ function readCsv(zip, name) {
   });
 }
 
-async function readStopTimes(zip) {
+async function readStopTimes(zip, keepTrips) {
   const byStop = new Map();
   const last = new Map();
   const tStops = new Map();
@@ -109,6 +109,7 @@ async function readStopTimes(zip) {
     parse({ columns: true, skip_empty_lines: true, bom: true, relax_column_count: true, trim: true })
   );
   for await (const r of parser) {
+    if (keepTrips && !keepTrips.has(r.trip_id)) continue;
     const seq = parseInt(r.stop_sequence, 10);
     const cur = last.get(r.trip_id);
     if (!cur || seq > cur.seq) last.set(r.trip_id, { seq, stop: r.stop_id });
@@ -139,7 +140,7 @@ function linesOf(stopIds) {
   return [...set].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
-async function readShapes(zip) {
+async function readShapes(zip, keepShapes) {
   const raw = new Map();
   const entry = zip.getEntry('shapes.txt');
   if (!entry) return raw;
@@ -147,6 +148,7 @@ async function readShapes(zip) {
     parse({ columns: true, skip_empty_lines: true, bom: true, relax_column_count: true, trim: true })
   );
   for await (const r of parser) {
+    if (keepShapes && !keepShapes.has(r.shape_id)) continue;
     const lat = parseFloat(r.shape_pt_lat), lon = parseFloat(r.shape_pt_lon);
     const seq = parseInt(r.shape_pt_sequence, 10);
     if (isNaN(lat) || isNaN(lon)) continue;
@@ -218,10 +220,25 @@ async function loadStatic() {
   }
   const cal = readCsv(zip, 'calendar.txt');
   const calDates = readCsv(zip, 'calendar_dates.txt');
-  const times = await readStopTimes(zip);
-  const shp = await readShapes(zip);
 
-  stations = merged; alias = al; routes = rt; trips = tr; calendar = cal; calendarDates = calDates;
+  // لتوفير الذاكرة: نحتفظ فقط بالرحلات العاملة خلال الأيام السبعة القادمة
+  calendar = cal; calendarDates = calDates; activeCache.clear();
+  const keepServices = new Set();
+  const nowMs = Date.now();
+  for (let off = -1; off <= 7; off++) {
+    const pp = parisYMD(nowMs + off * 86400000);
+    for (const sv of activeServices(pp.y, pp.m, pp.d)) keepServices.add(sv);
+  }
+  let activeTrips = new Map();
+  for (const [id, t] of tr) if (keepServices.has(t.service_id)) activeTrips.set(id, t);
+  if (activeTrips.size === 0) activeTrips = tr; // احتياط إن لم نجد تقويماً صالحاً
+  const keepShapes = new Set();
+  for (const t of activeTrips.values()) if (t.shape_id) keepShapes.add(t.shape_id);
+
+  const times = await readStopTimes(zip, activeTrips);
+  const shp = await readShapes(zip, keepShapes);
+
+  stations = merged; alias = al; routes = rt; trips = activeTrips; calendar = cal; calendarDates = calDates;
   stopTimes = times.byStop; lastStop = times.last; stopTimesCount = times.count;
   tripStops = times.tStops;
   stopNames = new Map(stops.map((x) => [x.stop_id, x.stop_name]));
@@ -252,7 +269,8 @@ async function loadStatic() {
   rawStations = st;
   for (const x of stations.values()) x.lines = linesOf(x.stopIds);
   loadedAt = new Date();
-  console.log(`جاهز: ${merged.size} محطة، ${rt.size} خط، ${tr.size} رحلة، ${times.count} توقف مجدول`);
+  console.log(`جاهز: ${merged.size} محطة، ${rt.size} خط، ${activeTrips.size} رحلة، ${times.count} توقف مجدول`);
+  console.log(`الذاكرة: ${Math.round(process.memoryUsage().rss / 1048576)} MB`);
 }
 
 // ───────── الوقت الحقيقي ─────────
