@@ -98,6 +98,67 @@ function readCsv(zip, name) {
   });
 }
 
+// قراءة ملف CSV كبير سطراً بسطر دون تخزين كل السجلات في الذاكرة
+// (أخف بكثير من csv-parse، ويُتيح للخادم أن يردّ على الطلبات أثناء التحميل)
+async function scanCsv(zip, name, onRow) {
+  const entry = zip.getEntry(name);
+  if (!entry) return;
+  const buf = entry.getData();
+  const len = buf.length;
+  let pos = len >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf ? 3 : 0;
+  let col = null;
+  let n = 0;
+  while (pos < len) {
+    let end = buf.indexOf(10, pos);
+    if (end === -1) end = len;
+    let line = buf.toString('utf8', pos, end);
+    pos = end + 1;
+    if (line.charCodeAt(line.length - 1) === 13) line = line.slice(0, -1);
+    if (!line) continue;
+    let cells;
+    if (line.indexOf('"') >= 0) {
+      try { cells = parseSync(line, { relax_column_count: true })[0]; } catch (e) { continue; }
+    } else {
+      cells = line.split(',');
+    }
+    if (!cells) continue;
+    if (!col) {
+      col = {};
+      cells.forEach((h, i) => { col[String(h).trim()] = i; });
+      continue;
+    }
+    onRow(cells, col);
+    if (++n % 40000 === 0) await new Promise((ok) => setImmediate(ok));
+  }
+}
+
+const tick = () => new Promise((ok) => setImmediate(ok));
+
+// تقسيم سطر CSV (مع دعم الاقتباس)
+function splitCsvLine(line) {
+  if (line.indexOf('"') === -1) return line.split(',');
+  const r = parseSync(line, { relax_column_count: true, relax_quotes: true });
+  return r[0] || [];
+}
+
+// نقرأ الملف سطراً سطراً دون إنشاء ملايين الكائنات دفعة واحدة،
+// ونترك الخادم يتنفس بين الدفعات (مهم جداً في الاستضافة المجانية)
+async function eachLine(buf, onLine) {
+  const n = buf.length;
+  let start = 0;
+  if (n >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) start = 3;
+  let k = 0;
+  while (start < n) {
+    let end = buf.indexOf(10, start);
+    if (end === -1) end = n;
+    let e2 = end;
+    if (e2 > start && buf[e2 - 1] === 13) e2--;
+    if (e2 > start) onLine(buf.toString('utf8', start, e2));
+    start = end + 1;
+    if (++k % 20000 === 0) await tick();
+  }
+}
+
 async function readStopTimes(zip, keepTrips) {
   const byStop = new Map();
   const last = new Map();
@@ -105,57 +166,72 @@ async function readStopTimes(zip, keepTrips) {
   let count = 0;
   const entry = zip.getEntry('stop_times.txt');
   if (!entry) return { byStop, last, count, tStops };
-  const parser = Readable.from([entry.getData()], { objectMode: false }).pipe(
-    parse({ columns: true, skip_empty_lines: true, bom: true, relax_column_count: true, trim: true })
-  );
-  for await (const r of parser) {
-    if (keepTrips && !keepTrips.has(r.trip_id)) continue;
-    const seq = parseInt(r.stop_sequence, 10);
-    const cur = last.get(r.trip_id);
-    if (!cur || seq > cur.seq) last.set(r.trip_id, { seq, stop: r.stop_id });
-    const secs = toSecs(r.arrival_time) ?? toSecs(r.departure_time);
-    if (secs == null) continue;
-    let arr = byStop.get(r.stop_id);
-    if (!arr) { arr = []; byStop.set(r.stop_id, arr); }
-    arr.push([r.trip_id, secs]);
-    let ts = tStops.get(r.trip_id);
-    if (!ts) { ts = []; tStops.set(r.trip_id, ts); }
-    ts.push([seq, r.stop_id, secs]);
+  const buf = entry.getData();
+  let ix = null;
+  await eachLine(buf, (line) => {
+    if (!ix) {
+      const h = splitCsvLine(line).map((x) => x.trim());
+      ix = {
+        trip: h.indexOf('trip_id'), arr: h.indexOf('arrival_time'), dep: h.indexOf('departure_time'),
+        stop: h.indexOf('stop_id'), seq: h.indexOf('stop_sequence'),
+      };
+      return;
+    }
+    // نتحقق من الرحلة قبل تقسيم السطر كله (أسرع وأقل ذاكرة)
+    if (keepTrips && ix.trip === 0 && line.charCodeAt(0) !== 34) {
+      const c = line.indexOf(',');
+      if (c > 0 && !keepTrips.has(line.slice(0, c))) return;
+    }
+    const f = splitCsvLine(line);
+    const tripId = f[ix.trip];
+    if (!tripId || (keepTrips && !keepTrips.has(tripId))) return;
+    const stopId = f[ix.stop];
+    const seq = parseInt(f[ix.seq], 10);
+    const cur = last.get(tripId);
+    if (!cur || seq > cur.seq) last.set(tripId, { seq, stop: stopId });
+    const secs = toSecs(f[ix.arr]) ?? toSecs(f[ix.dep]);
+    if (secs == null) return;
+    let arr = byStop.get(stopId);
+    if (!arr) { arr = []; byStop.set(stopId, arr); }
+    arr.push([tripId, secs]);
+    let ts = tStops.get(tripId);
+    if (!ts) { ts = []; tStops.set(tripId, ts); }
+    ts.push([seq, stopId, secs]);
     count++;
-  }
+  });
   for (const ts of tStops.values()) ts.sort((x, y) => x[0] - y[0]);
   return { byStop, last, count, tStops };
-}
-
-// الخطوط التي تخدم مجموعة توقفات
-function linesOf(stopIds) {
-  const set = new Set();
-  for (const sid of stopIds) {
-    for (const [tripId] of stopTimes.get(sid) || []) {
-      const tr = trips.get(tripId);
-      const r = tr && routes.get(tr.route_id);
-      if (r && r.short) set.add(r.short);
-    }
-  }
-  return [...set].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
 async function readShapes(zip, keepShapes) {
   const raw = new Map();
   const entry = zip.getEntry('shapes.txt');
   if (!entry) return raw;
-  const parser = Readable.from([entry.getData()], { objectMode: false }).pipe(
-    parse({ columns: true, skip_empty_lines: true, bom: true, relax_column_count: true, trim: true })
-  );
-  for await (const r of parser) {
-    if (keepShapes && !keepShapes.has(r.shape_id)) continue;
-    const lat = parseFloat(r.shape_pt_lat), lon = parseFloat(r.shape_pt_lon);
-    const seq = parseInt(r.shape_pt_sequence, 10);
-    if (isNaN(lat) || isNaN(lon)) continue;
-    let a = raw.get(r.shape_id);
-    if (!a) { a = []; raw.set(r.shape_id, a); }
+  const buf = entry.getData();
+  let ix = null;
+  await eachLine(buf, (line) => {
+    if (!ix) {
+      const h = splitCsvLine(line).map((x) => x.trim());
+      ix = {
+        id: h.indexOf('shape_id'), lat: h.indexOf('shape_pt_lat'),
+        lon: h.indexOf('shape_pt_lon'), seq: h.indexOf('shape_pt_sequence'),
+      };
+      return;
+    }
+    if (keepShapes && ix.id === 0 && line.charCodeAt(0) !== 34) {
+      const c = line.indexOf(',');
+      if (c > 0 && !keepShapes.has(line.slice(0, c))) return;
+    }
+    const f = splitCsvLine(line);
+    const id = f[ix.id];
+    if (!id || (keepShapes && !keepShapes.has(id))) return;
+    const lat = parseFloat(f[ix.lat]), lon = parseFloat(f[ix.lon]);
+    const seq = parseInt(f[ix.seq], 10);
+    if (isNaN(lat) || isNaN(lon)) return;
+    let a = raw.get(id);
+    if (!a) { a = []; raw.set(id, a); }
     a.push([seq, lat, lon]);
-  }
+  });
   const out = new Map();
   for (const [id, a] of raw) {
     a.sort((x, y) => x[0] - y[0]);
@@ -235,8 +311,13 @@ async function loadStatic() {
   const keepShapes = new Set();
   for (const t of activeTrips.values()) if (t.shape_id) keepShapes.add(t.shape_id);
 
+  console.log(`قراءة الجدول الزمني (${activeTrips.size} رحلة فعالة)...`);
+  await tick();
   const times = await readStopTimes(zip, activeTrips);
+  await tick();
   const shp = await readShapes(zip, keepShapes);
+  await tick();
+  console.log(`انتهت القراءة: ${times.count} توقف`);
 
   stations = merged; alias = al; routes = rt; trips = activeTrips; calendar = cal; calendarDates = calDates;
   stopTimes = times.byStop; lastStop = times.last; stopTimesCount = times.count;
